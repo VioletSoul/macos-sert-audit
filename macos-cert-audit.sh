@@ -8,9 +8,14 @@ LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 SYSTEM_KEYCHAIN=/Library/Keychains/System.keychain
 SYSTEM_ROOTS=/System/Library/Keychains/SystemRootCertificates.keychain
 
-TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/macos-cert-audit.XXXXXX")
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/macos-cert-audit.XXXXXX") || {
+    echo "failed to create temporary directory" >&2
+    exit 1
+}
+
 CERT_DB="$TMP_DIR/certificates.tsv"
 TRUST_DB="$TMP_DIR/trust.tsv"
+WARN_DB="$TMP_DIR/warnings.log"
 
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM HUP
 
@@ -38,47 +43,20 @@ OUTPUT=report
 
 usage()
 {
-    echo "usage: $0 [options]"
-    echo
-    echo "  --compact           compact certificate output"
-    echo "  --no-system-roots   skip Apple's System Root store"
-    echo "  --expired           show expired certificates"
-    echo "  --roots             show CA certificates"
-    echo "  --user              show Login Keychain certificates"
-    echo "  --interesting       show potentially interesting certificates"
-    echo "  --data              print collected TSV data"
-    echo "  --trust             print trust settings"
-    echo "  --help              show this help"
+    cat <<EOF
+usage: $0 [options]
+
+  --compact           compact certificate output
+  --no-system-roots   skip Apple's System Root store
+  --expired           show expired certificates
+  --roots             show CA certificates
+  --user              show Login Keychain certificates
+  --interesting       show potentially interesting certificates
+  --data              print collected TSV data
+  --trust             print explicit trust settings
+  --help              show this help
+EOF
     exit 0
-}
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --compact) COMPACT=1 ;;
-        --no-system-roots) SCAN_ROOTS=0 ;;
-        --expired) OUTPUT=expired ;;
-        --roots) OUTPUT=roots ;;
-        --user) OUTPUT=user ;;
-        --interesting) OUTPUT=interesting ;;
-        --data) OUTPUT=data ;;
-        --trust) OUTPUT=trust ;;
-        --help) usage ;;
-        *)
-            echo "unknown option: $1"
-            usage
-            ;;
-    esac
-    shift
-done
-
-[ -x "$SECURITY" ] || {
-    echo "security command not found: $SECURITY"
-    exit 1
-}
-
-[ -x "$OPENSSL" ] || {
-    echo "openssl command not found: $OPENSSL"
-    exit 1
 }
 
 header()
@@ -86,17 +64,22 @@ header()
     printf '\n%s== %s ==%s\n' "$CYAN" "$1" "$RESET"
 }
 
+warn()
+{
+    printf '%s\n' "$1" >> "$WARN_DB"
+}
+
 split_pem()
 {
     input=$1
     output=$2
 
-    mkdir -p "$output"
+    mkdir -p "$output" || return 1
 
-    awk '
+    awk -v output="$output" '
         /-----BEGIN CERTIFICATE-----/ {
             n++
-            file=sprintf("'"$output"'/cert_%05d.pem", n)
+            file=sprintf("%s/cert_%05d.pem", output, n)
         }
         file != "" {
             print > file
@@ -113,15 +96,22 @@ collect_keychain()
     keychain=$1
     store=$2
 
-    [ -f "$keychain" ] || return
+    [ -f "$keychain" ] || return 0
 
     pem="$TMP_DIR/$(basename "$keychain").pem"
     dir="$TMP_DIR/$(basename "$keychain")"
 
-    "$SECURITY" find-certificate -a -p "$keychain" > "$pem" 2>/dev/null || return
-    [ -s "$pem" ] || return
+    if ! "$SECURITY" find-certificate -a -p "$keychain" > "$pem" 2>/dev/null; then
+        warn "Could not read certificate store: $store ($keychain)"
+        return 0
+    fi
 
-    split_pem "$pem" "$dir"
+    [ -s "$pem" ] || return 0
+
+    if ! split_pem "$pem" "$dir"; then
+        warn "Could not split PEM output for store: $store"
+        return 0
+    fi
 
     for cert in "$dir"/cert_*.pem; do
         [ -f "$cert" ] || continue
@@ -156,29 +146,48 @@ collect_keychain()
             sed 's/^.*Fingerprint=//'
         )
 
+        cert_text=$(
+            "$OPENSSL" x509 -in "$cert" -noout -text 2>/dev/null
+        ) || {
+            warn "Could not parse certificate in store: $store"
+            continue
+        }
+
         constraints=$(
-            "$OPENSSL" x509 -in "$cert" -noout -text 2>/dev/null |
-            grep -A1 'Basic Constraints:' |
-            tr '\n' ' ' |
-            sed 's/  */ /g'
+            printf '%s\n' "$cert_text" |
+            awk '
+                /X509v3 Basic Constraints:/ {
+                    getline
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                    print
+                    exit
+                }
+            '
         )
 
         key_usage=$(
-            "$OPENSSL" x509 -in "$cert" -noout -text 2>/dev/null |
-            grep -A1 'Key Usage:' |
-            tr '\n' ' ' |
-            sed 's/  */ /g'
+            printf '%s\n' "$cert_text" |
+            awk '
+                /X509v3 Key Usage:/ {
+                    getline
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                    print
+                    exit
+                }
+            '
         )
 
         ca=0
-        self_signed=0
+        self_issued=0
         expired=0
 
         case "$constraints" in
             *CA:TRUE*) ca=1 ;;
         esac
 
-        [ "$subject" = "$issuer" ] && self_signed=1
+        # Same subject and issuer means self-issued.
+        # This does not by itself prove that the certificate is self-signed.
+        [ "$subject" = "$issuer" ] && self_issued=1
 
         "$OPENSSL" x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 ||
             expired=1
@@ -192,7 +201,7 @@ collect_keychain()
             "$not_after" \
             "$sha256" \
             "$ca" \
-            "$self_signed" \
+            "$self_issued" \
             "$expired" \
             "$key_usage" >> "$CERT_DB"
     done
@@ -234,8 +243,8 @@ report_all()
     if [ "$COMPACT" -eq 1 ]; then
         awk -F '\t' '
             NR > 1 {
-                printf "%-24s %-60s CA=%s SELF=%s EXPIRED=%s\n",
-                    $1, substr($2,1,60), $8, $9, $10
+                printf "%-24s %-60s CA=%s SELF_ISSUED=%s EXPIRED=%s\n",
+                    $1, substr($2, 1, 60), $8, $9, $10
             }
         ' "$CERT_DB"
         return
@@ -244,7 +253,7 @@ report_all()
     count=0
 
     tail -n +2 "$CERT_DB" |
-    while IFS="$(printf '\t')" read -r store subject issuer serial not_before not_after sha256 ca self_signed expired key_usage
+    while IFS="$(printf '\t')" read -r store subject issuer serial not_before not_after sha256 ca self_issued expired key_usage
     do
         count=$((count + 1))
 
@@ -257,7 +266,7 @@ report_all()
         printf 'Until       : %s\n' "$not_after"
         printf 'SHA-256     : %s\n' "$sha256"
         printf 'CA          : %s\n' "$ca"
-        printf 'Self-signed : %s\n' "$self_signed"
+        printf 'Self-issued : %s\n' "$self_issued"
 
         if [ "$expired" -eq 1 ]; then
             printf '%sStatus      : EXPIRED%s\n' "$RED" "$RESET"
@@ -298,7 +307,7 @@ report_user()
 
     awk -F '\t' '
         NR > 1 && $1 == "Login Keychain" {
-            printf "%s | CA=%s | SELF=%s | EXPIRED=%s\n",
+            printf "%s | CA=%s | SELF_ISSUED=%s | EXPIRED=%s\n",
                 $2, $8, $9, $10
         }
     ' "$CERT_DB"
@@ -317,10 +326,10 @@ report_interesting()
                 printf "[USER_CA] %s | %s\n", $1, $2
 
             if ($1 == "Login Keychain" && $9 == 1 && $8 == 0)
-                printf "[USER_SELF_SIGNED] %s | %s\n", $1, $2
+                printf "[USER_SELF_ISSUED] %s | %s\n", $1, $2
 
             if ($1 == "System Keychain" && $8 == 1 && $9 == 1)
-                printf "[SYSTEM_SELF_SIGNED_CA] %s | %s\n", $1, $2
+                printf "[SYSTEM_SELF_ISSUED_CA] %s | %s\n", $1, $2
         }
     ' "$CERT_DB"
 }
@@ -332,7 +341,7 @@ report_data()
 
 report_trust()
 {
-    header "Trust Settings"
+    header "Explicit Trust Settings"
 
     if [ -s "$TRUST_DB" ]; then
         cat "$TRUST_DB"
@@ -341,9 +350,46 @@ report_trust()
     fi
 }
 
-: > "$CERT_DB"
+report_warnings()
+{
+    if [ -s "$WARN_DB" ]; then
+        header "Warnings"
+        cat "$WARN_DB"
+    fi
+}
 
-printf 'store\tsubject\tissuer\tserial\tnot_before\tnot_after\tsha256\tca\tself_signed\texpired\tkey_usage\n' \
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --compact) COMPACT=1 ;;
+        --no-system-roots) SCAN_ROOTS=0 ;;
+        --expired) OUTPUT=expired ;;
+        --roots) OUTPUT=roots ;;
+        --user) OUTPUT=user ;;
+        --interesting) OUTPUT=interesting ;;
+        --data) OUTPUT=data ;;
+        --trust) OUTPUT=trust ;;
+        --help) usage ;;
+        *)
+            echo "unknown option: $1" >&2
+            usage
+            ;;
+    esac
+    shift
+done
+
+[ -x "$SECURITY" ] || {
+    echo "security command not found: $SECURITY" >&2
+    exit 1
+}
+
+[ -x "$OPENSSL" ] || {
+    echo "openssl command not found: $OPENSSL" >&2
+    exit 1
+}
+
+: > "$WARN_DB"
+
+printf 'store\tsubject\tissuer\tserial\tnot_before\tnot_after\tsha256\tca\tself_issued\texpired\tkey_usage\n' \
     > "$CERT_DB"
 
 if [ "$SCAN_ROOTS" -eq 1 ]; then
@@ -372,27 +418,21 @@ case "$OUTPUT" in
 
         report_all
         ;;
-
     expired)
         report_expired
         ;;
-
     roots)
         report_roots
         ;;
-
     user)
         report_user
         ;;
-
     interesting)
         report_interesting
         ;;
-
     data)
         report_data
         ;;
-
     trust)
         report_trust
         ;;
@@ -405,6 +445,8 @@ if [ "$OUTPUT" = "report" ]; then
         profiles status -type enrollment 2>/dev/null || true
         echo
         profiles list -type configuration 2>/dev/null || true
+    else
+        echo "profiles command not found."
     fi
 
     header "Summary"
@@ -437,7 +479,7 @@ if [ "$OUTPUT" = "report" ]; then
         ' "$CERT_DB"
     )
 
-    SELF_COUNT=$(
+    SELF_ISSUED_COUNT=$(
         awk -F '\t' '
             NR > 1 && $9 == 1 { n++ }
             END { print n+0 }
@@ -455,14 +497,17 @@ if [ "$OUTPUT" = "report" ]; then
     printf 'System       : %s\n' "$SYSTEM_COUNT"
     printf 'Login        : %s\n' "$LOGIN_COUNT"
     printf 'CA           : %s\n' "$CA_COUNT"
-    printf 'Self-signed  : %s\n' "$SELF_COUNT"
+    printf 'Self-issued  : %s\n' "$SELF_ISSUED_COUNT"
     printf 'Expired      : %s\n' "$EXPIRED_COUNT"
 
     if [ "$EXPIRED_COUNT" -gt 0 ]; then
-        printf '%s[!] expired certificates found%s\n' "$YELLOW" "$RESET"
+        printf '%s[!] expired certificates present; review trust and usage before taking action%s\n' \
+            "$YELLOW" "$RESET"
     else
         printf '%s[+] no expired certificates%s\n' "$GREEN" "$RESET"
     fi
+
+    report_warnings
 
     printf '\nNo changes were made.\n'
 fi
