@@ -6,7 +6,7 @@
 [![Status](https://img.shields.io/badge/status-work--in--progress-orange.svg)](#status)
 [![ShellCheck](https://img.shields.io/badge/ShellCheck-compatible-brightgreen.svg)](https://www.shellcheck.net/)
 
-Read-only macOS certificate, keychain, and trust settings audit tool.
+Read-only macOS certificate, keychain, explicit trust settings, and basic MDM/profile audit tool.
 
 ## Status
 
@@ -14,7 +14,9 @@ Work in progress.
 
 ## Description
 
-A lightweight POSIX shell utility for auditing certificates available through macOS keychains and collecting X.509 metadata, certificate status, trust settings, and basic profile/MDM information.
+A lightweight POSIX shell utility for auditing certificates available through macOS keychains.
+
+It collects X.509 certificate metadata, validity and expiration status, CA and self-issued status, key usage information, explicit trust settings, and basic configuration profile / MDM enrollment information.
 
 The tool is designed for inspection and analysis. It does not modify the system.
 
@@ -22,7 +24,7 @@ The tool is designed for inspection and analysis. It does not modify the system.
 
 - macOS
 - `/usr/bin/security`
-- OpenSSL
+- `/usr/bin/openssl`
 - POSIX-compatible `sh`
 
 ## Usage
@@ -35,6 +37,7 @@ chmod +x macos-cert-audit.sh
 Available modes:
 
 ```sh
+./macos-cert-audit.sh --compact
 ./macos-cert-audit.sh --expired
 ./macos-cert-audit.sh --roots
 ./macos-cert-audit.sh --user
@@ -43,9 +46,13 @@ Available modes:
 ./macos-cert-audit.sh --data
 ```
 
-The default audit scans the System Root Certificates keychain, the System keychain, and the current user's Login keychain.
+The default audit scans:
 
-The system root store can be excluded with:
+- Apple System Root Certificates store
+- System keychain
+- Current user's Login keychain
+
+Exclude Apple’s System Root Certificates store when a faster, narrower scan is needed:
 
 ```sh
 ./macos-cert-audit.sh --no-system-roots
@@ -53,17 +60,39 @@ The system root store can be excluded with:
 
 ## Collected Data
 
-The audit collects certificate subject and issuer, serial number, validity period, SHA-256 fingerprint, CA status, self-signed status, key usage information, and expiration status.
+For each certificate, the audit collects:
 
-Trust settings are collected separately where available.
+- Keychain store name
+- Subject and issuer
+- Serial number
+- Validity period
+- SHA-256 fingerprint
+- CA status
+- Self-issued status
+- Key usage information
+- Expiration status
 
-The report also includes basic macOS configuration profile and MDM enrollment information when supported by the installed `profiles` command.
+`Self-issued` means that the certificate Subject and Issuer fields are identical. This indicator alone does not cryptographically prove that a certificate is self-signed.
+
+The `--trust` mode displays explicit trust settings reported by macOS for user, admin, and system scopes where available.
+
+The default report also includes basic configuration profile and MDM enrollment information when supported by the installed `profiles` command.
 
 ## Safety
 
 The script operates in read-only mode.
 
 It does not install, remove, modify, or change the trust state of certificates, keychains, configuration profiles, or MDM settings.
+
+The script creates temporary files only for processing certificate data and removes them automatically when it exits.
+
+## Limitations
+
+- An expired certificate is not necessarily active, trusted, malicious, or in use by an application.
+- The audit does not perform full certificate-chain validation for every certificate and possible usage context.
+- Explicit trust settings are not equivalent to a complete effective trust decision for every certificate.
+- Some keychains, profiles, or MDM details may be inaccessible depending on macOS version, user permissions, and device-management configuration.
+- This project is intended as a technical inspection utility, not as a replacement for enterprise endpoint management, incident response, or certificate lifecycle management tools.
 
 ## License
 
