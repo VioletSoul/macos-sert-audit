@@ -465,6 +465,9 @@ means that an expired non-Apple certificate exists in the user's Login Keychain.
 
 It does not prove that the certificate is currently being used.
 
+> The repository also contains independent validation checks used to
+> cross-check certificate inventory against native macOS security tools.
+
 ---
 
 ## Limitations
