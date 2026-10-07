@@ -575,18 +575,23 @@ scan_trust_domain()
     current=''
     result=''
     policy=''
+    rules=0
     while IFS= read -r line; do
         case "$line" in
             Cert\ *)
                 if [ -n "$current" ]; then
-                    "$PRINTF" '%s\t%s\t%s\t%s\n' "$domain" "$current" "$result" "$policy" >> "$TRUST_TSV"
+                    "$PRINTF" '%s\t%s\t%s\t%s\t%s\n' "$domain" "$current" "$result" "$policy" "$rules" >> "$TRUST_TSV"
                 fi
                 current=$(printf '%s\n' "$line" | one_line)
                 result=''
                 policy=''
+                rules=0
                 ;;
-            *Result\ Type:*) result=$(printf '%s\n' "$line" | one_line) ;;
-            *Policy\ OID:*|*Policy\ String:*)
+            *Result[[:space:]]Type[[:space:]]*:[[:space:]]*)
+                result=$(printf '%s\n' "$line" | one_line)
+                rules=$((rules + 1))
+                ;;
+            *Policy[[:space:]]OID[[:space:]]*:[[:space:]]*|*Policy[[:space:]]String[[:space:]]*:[[:space:]]*)
                 p=$(printf '%s\n' "$line" | one_line)
                 if [ -z "$policy" ]; then policy="$p"; else policy="$policy; $p"; fi
                 ;;
@@ -594,7 +599,7 @@ scan_trust_domain()
     done < "$raw"
 
     if [ -n "$current" ]; then
-        "$PRINTF" '%s\t%s\t%s\t%s\n' "$domain" "$current" "$result" "$policy" >> "$TRUST_TSV"
+        "$PRINTF" '%s\t%s\t%s\t%s\t%s\n' "$domain" "$current" "$result" "$policy" "$rules" >> "$TRUST_TSV"
     fi
 }
 
@@ -825,16 +830,23 @@ render_trust()
     section 'Trust Configuration'
     user=$(count_field 1 user "$TRUST_TSV")
     admin=$(count_field 1 admin "$TRUST_TSV")
+    user_rules=$($AWK -F '\t' '$1=="user" {n += $5} END{print n+0}' "$TRUST_TSV")
+    admin_rules=$($AWK -F '\t' '$1=="admin" {n += $5} END{print n+0}' "$TRUST_TSV")
+
     if [ "$user" -eq 0 ]; then
-        kv 'User overrides' 'none'
+        kv 'User trust entries' 'none'
     else
-        kv 'User overrides' "$user"
+        kv 'User trust entries' "$user"
+        kv 'User explicit rules' "$user_rules"
     fi
+
     if [ "$admin" -eq 0 ]; then
-        kv 'Admin overrides' 'none'
+        kv 'Admin trust entries' 'none'
     else
-        kv 'Admin overrides' "$admin"
+        kv 'Admin trust entries' "$admin"
+        kv 'Admin explicit rules' "$admin_rules"
     fi
+
     kv 'System trust' 'built-in root store'
 }
 
